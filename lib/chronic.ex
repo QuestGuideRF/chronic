@@ -1,0 +1,426 @@
+defmodule Chronic do
+  @moduledoc """
+  Chronic — это анализатор естественного языка Pure Elixir для определения времени и дат.
+  """
+
+  @doc """
+  Анализирует указанное время. Вернет `{:ok, time, utc_offset}`, если знает
+  время, иначе `{:error, :unknown_format}`.
+
+  ## Примеры
+
+  ISO8601 times вернет смещение, если оно указано:
+
+      iex> Chronic.parse("2012-08-02T13:00:00")
+      { :ok, %NaiveDateTime{день: 2, час: 13, минута: 0, месяц: 8, секунда: 0, микросекунда: {0,0}, год: 2012}, ноль }
+
+      iex> Chronic.parse("2012-08-02T13:00:00+01:00")
+      { :ok, %NaiveDateTime{день: 2, час: 13, минута: 0, месяц: 8, секунда: 0, микросекунда: {0,0}, год: 2012}, 3600 }
+
+  Вы можете передать опцию, чтобы определить "current" время для хроники:
+
+      iex> Chronic.parse("aug 2", currently: {{1999, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{day: 2, hour: 0, minute: 0, month: 8, second: 0, microsecond: {0, 6}, year: 1999}, 0 }
+
+  **All examples here use `currently` so that they are not affected by the
+  passing of time. You may leave the `currently` option off.**
+
+      iex> Chronic.parse("aug 2 9am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 0, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("aug 2 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("aug 2nd 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("aug. 2nd 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("2 aug 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("2 aug at 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("2nd of aug 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0, 6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("2nd of aug at 9:15am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0,6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("2nd of aug at 9:15 am", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 2, час: 9, минута: 15, месяц: 8, секунда: 0, микросекунда: {0,6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("Feb 29", в настоящее время: {{2016, 1, 1}, {0,0,0}})
+      { :ok, %NaiveDateTime{день: 29, час: 0, минута: 0, месяц: 2, секунда: 0, микросекунда: {0,6}, год: 2016}, 0 }
+
+      iex> Chronic.parse("Feb 29", в настоящее время: {{2017, 1, 1}, {0,0,0}})
+      { :error, :invalid_datetime }
+
+      iex> Chronic.parse("Nov 31")
+      { :error, :invalid_datetime }
+
+  """
+
+  alias Chronic.Tokenizer
+
+  def parse(time, opts \\ []) do
+    case DateTime.from_iso8601(time) do
+      {:ok, %DateTime{} = dt, offset} ->
+        ndt = dt |> DateTime.to_naive() |> NaiveDateTime.add(offset)
+        {:ok, ndt, offset}
+
+      {:error, :missing_offset} ->
+        ndt = NaiveDateTime.from_iso8601!(time)
+        {:ok, ndt, nil}
+
+      _ -> parse_natural_language(time, opts)
+    end
+  end
+
+  defp parse_natural_language(time_as_string, opts) do
+    currently = opts[:currently] || :calendar.universal_time
+    result = time_as_string |> preprocess |> debug(opts[:debug]) |> process(currently: currently)
+
+    with {:ok, datetime = %NaiveDateTime{}} <- result do
+      {:ok, datetime, 0}
+    else
+      {:error, :invalid_date} -> {:error, :invalid_datetime}
+      {:error, :unknown_format} -> {:error, :unknown_format}
+    end
+  end
+
+  defp preprocess(time) do
+    time
+    |> String.replace("-", " ")
+    # Преобразует строки типа «9 утра» в «9 утра».
+    |> String.replace(~r/(?<=\d)\s+(?=[a|p]m\b)/i, "")
+    |> String.split(" ")
+    |> Tokenizer.tokenize
+  end
+
+  # 2 августа
+  defp process([month: month, number: day], [currently: currently]) do
+    process_day_and_month(currently, day, month)
+  end
+
+  # 2 августа, 9 утра
+  defp process([month: month, number: day, time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 2 августа в 9 утра
+  defp process([month: month, number: day, word: "at", time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 2 августа
+  defp process([number: day, month: month], [currently: currently]) do
+    process_day_and_month(currently, day, month)
+  end
+
+  # 2016 2 августа
+  defp process([number: day, month: month, number: year], [currently: currently]) when day <= 31 do
+    process_day_and_month_and_year(currently, day, month, year)
+  end
+
+  # 2 августа 2016 г.
+  defp process([number: year, month: month, number: day], [currently: currently]) when day > 31 do
+    process_day_and_month_and_year(currently, day, month, year)
+  end
+
+  defp process([number: year, month: month, number: day], [currently: currently]) do
+    process_day_and_month_and_year(currently, day, month, year)
+  end
+
+  # 2 августа, 9 утра
+  defp process([number: day, month: month, time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 2 августа в 9 утра
+  defp process([number: day, month: month, word: "at", time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 2 августа
+  defp process([number: day, word: "of", month: month], [currently: currently]) do
+    process_day_and_month(currently, day, month)
+  end
+
+  # 2 августа, 9 утра
+  defp process([number: day, word: "of", month: month, time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 2 августа в 9 утра.
+  defp process([number: day, word: "of", month: month, word: "at", time: time], [currently: currently]) do
+    process_day_and_month(currently, day, month, time)
+  end
+
+  # 9am
+  # 9:30am
+  # 9:30:15am
+  # 9:30:15.123456am
+  defp process([time: time], [currently: currently]) do
+    combine(currently, time: time)
+  end
+
+  # с 10 до 8
+  defp process([number: minutes, word: "to", number: hour], [currently: {{year, month, day}, _}]) do
+    with {:ok, datetime} <- combine(
+      year: year,
+      month: month,
+      day: day,
+      hour: hour,
+      minute: 0,
+      second: 0,
+      microsecond: {0, 6}
+    ) do
+      {:ok, datetime |> NaiveDateTime.add(-minutes * 60, :second)}
+    end
+  end
+
+  # с 10 до 8 утра
+  defp process([number: minutes, word: "to", time: time], [currently: {{year, month, day}, _}]) do
+    with {:ok, datetime} <- combine([year: year, month: month, day: day] ++ time) do
+      {:ok, datetime |> NaiveDateTime.add(-minutes * 60, :second)}
+    end
+  end
+
+  # половина третьего
+  # половина 14:00
+  defp process([word: "half", word: "past", number: hour], [currently: {{year, month, day}, _}]) do
+    dt = combine(
+      year: year,
+      month: month,
+      day: day,
+      hour: hour,
+      minute: 0,
+      second: 0,
+      microsecond: {0, 6}
+    )
+    with {:ok, datetime} <- dt do
+      {:ok, datetime |> NaiveDateTime.add(30 * 60)}
+    end
+  end
+
+  # Вчера в 9 утра
+  defp process([word: "yesterday", word: "at", time: time], [currently: currently]) do
+    process_yesterday(currently, time)
+  end
+
+  # Вчера 9 утра
+  defp process([word: "yesterday", time: time], [currently: currently]) do
+    process_yesterday(currently, time)
+  end
+
+  # Завтра в 9 утра
+  defp process([word: "tomorrow", word: "at", time: time], [currently: currently]) do
+    process_tomorrow(currently, time)
+  end
+
+  # Сегодня 9 утра
+  defp process([word: "today", time: time], [currently: currently]) do
+    process_today(currently, time)
+  end
+
+  # Сегодня в 9 утра
+  defp process([word: "today", word: "at", time: time], [currently: currently]) do
+    process_today(currently, time)
+  end
+
+  # Tueesday
+  defp process([day_of_the_week: day_of_the_week], [currently: {current_date, _}]) do
+    dotw = current_date |> find_next_day_of_the_week(day_of_the_week)
+
+    parts = dotw ++ [
+      hour: 12, minute: 0, second: 0, microsecond: {0, 6}
+    ]
+    combine(parts)
+  end
+
+  # Вторник, 9 утра
+  defp process([day_of_the_week: day_of_the_week, time: time], [currently: currently]) do
+    process_day_of_the_week_with_time(currently, day_of_the_week, time)
+  end
+
+  # вторник в 9 утра
+  defp process([day_of_the_week: day_of_the_week, word: "at", time: time], [currently: currently]) do
+    process_day_of_the_week_with_time(currently, day_of_the_week, time)
+  end
+
+  # 6 утра
+  defp process([number: hour, word: "in", word: "the", word: "morning"], [currently: {{year, month, day}, _}]) do
+    combine(year: year, month: month, day: day, hour: hour, minute: 0, second: 0, microsecond: {0, 6})
+  end
+
+  # 6 вечера
+  defp process([number: hour, word: "in", word: "the", word: "evening"], [currently: {{year, month, day}, _}]) do
+    combine(year: year, month: month, day: day, hour: hour + 12, minute: 0, second: 0, microsecond: {0, 6})
+  end
+
+  # суббота в 7 вечера
+  defp process([day_of_the_week: day_of_the_week, number: hour, word: "in", word: "the", word: "evening"], [currently: currently]) do
+    hour = hour + 12
+    date = currently |> date_for() |> find_next_day_of_the_week(day_of_the_week)
+
+    combine(date ++ [hour: hour, minute: 0, second: 0, microsecond: {0, 6}])
+  end
+
+  defp process(_, _opts) do
+    {:error, :unknown_format}
+  end
+
+  defp process_day_and_month(currently, day, month) do
+    combine(currently, month: month, day: day)
+  end
+
+  defp process_day_and_month(currently, day, month, time) do
+    combine(currently, month: month, day: day, time: time)
+  end
+
+  defp process_day_and_month_and_year(currently, day, month, year) do
+    combine(currently, month: month, day: day, year: year)
+  end
+
+  defp process_day_of_the_week_with_time(currently, day_of_the_week, time) do
+    current_date_erl = date_for(currently)
+    current_date_day_of_week =
+      current_date_erl
+      |> Date.from_erl!()
+      |> Date.day_of_week()
+    current_time = NaiveDateTime.from_erl!(currently)
+
+    [hour: hours, minute: minutes, second: seconds, microsecond: _] = time
+    parsed_time = NaiveDateTime.from_erl!({current_date_erl, {hours, minutes, seconds}})
+
+    is_same_day = current_date_day_of_week == day_of_the_week
+    is_later_today = is_same_day && current_time < parsed_time
+
+    parts = if is_later_today do
+      %{year: year, month: month, day: day} = Date.from_erl!(current_date_erl)
+      [year: year, month: month, day: day]
+    else
+      (current_date_erl |> find_next_day_of_the_week(day_of_the_week))
+    end
+
+    combine(parts ++ time)
+  end
+
+  defp process_yesterday({{year, month, day}, _}, time) do
+    with {:ok, datetime} <- combine([year: year, month: month, day: day] ++ time) do
+      {:ok, datetime |> NaiveDateTime.add(-86_400)}
+    end
+  end
+
+  defp process_tomorrow({{year, month, day}, _}, time) do
+    with {:ok, datetime} <- combine([year: year, month: month, day: day] ++ time) do
+      {:ok, datetime |> NaiveDateTime.add(86_400)}
+    end
+  end
+
+  defp process_today(currently, time) do
+    currently |> date_for() |> date_with_time(time)
+  end
+
+  defp combine(_, month: month, day: day, year: year) do
+    with {:ok, datetime} <- combine(
+      year: year,
+      month: month,
+      day: day,
+      hour: 0,
+      minute: 0,
+      second: 0,
+      microsecond: {0, 6}
+    ) do
+      {:ok, datetime |> change_year_to_four_digit}
+    end
+  end
+
+  defp combine({{year, _, _}, _}, month: month, day: day) do
+    combine(year: year, month: month, day: day, hour: 0, minute: 0, second: 0, microsecond: {0, 6})
+  end
+
+  defp combine({{year, _, _}, _}, month: month, day: day, time: time) do
+    combine([year: year, month: month, day: day] ++ time)
+  end
+
+  defp combine({{year, month, day}, _}, time: time) do
+    combine([year: year, month: month, day: day] ++ time)
+  end
+
+  defp combine(year: year, month: month, day: day, hour: hour, minute: minute, second: second, microsecond: microsecond) do
+    {{year, month, day}, {hour, minute, second}} |> NaiveDateTime.from_erl(microsecond)
+  end
+
+  defp change_year_to_four_digit(%NaiveDateTime{year: year} = ndt, year_guess \\ 2016) do
+    changed_year = year |> two_to_four_digit(year_guess)
+    %NaiveDateTime{ndt | year: changed_year}
+  end
+
+  defp two_to_four_digit(year, year_guess) when year < 100 do
+    closest_year(year, year_guess)
+  end
+  defp two_to_four_digit(year, _), do: year
+
+  defp closest_year(two_digit_year, year_guessing_base) do
+    two_digit_year
+    |> possible_years(year_guessing_base)
+    |> Enum.map(fn year -> {year, abs(year_guessing_base - year)} end)
+    |> Enum.min_by(fn {_year, diff} -> diff end)
+    |> elem(0)
+  end
+
+  defp possible_years(two_digit_year, year_guessing_base) do
+    year_guessing_base
+    |> centuries_for_guessing_base()
+    |> Enum.map(&(&1 + two_digit_year))
+  end
+
+  # Три столетия, наиболее близкие к базе догадок
+  # if you provide e.g. 2016 it should return [1900, 2000, 2100]
+  defp centuries_for_guessing_base(year_guessing_base) do
+    base_century = year_guessing_base - rem(year_guessing_base, 100)
+    [base_century - 100, base_century, base_century + 100]
+  end
+
+  defp find_next_day_of_the_week(current_date, day_of_the_week) do
+    current_date = case current_date do
+      %Date{} -> current_date
+      {_, _, _} = erl_date -> Date.from_erl!(erl_date)
+    end
+
+    tomorrow = Date.add(current_date, 1)
+
+    # Это необходимо, поскольку Date.day_of_week основан на понедельнике = 1 по воскресенью = 7.
+    # Однако на хронической неделе понедельник = 1, суббота = 6 и воскресенье = 0.
+    dow = Date.day_of_week(tomorrow)
+    tomorrow_day_of_week = if dow == 7, do: 0, else: dow
+
+    if tomorrow_day_of_week == day_of_the_week do
+      %{year: year, month: month, day: day} = tomorrow
+      [year: year, month: month, day: day]
+    else
+      find_next_day_of_the_week(tomorrow, day_of_the_week)
+    end
+  end
+
+  defp date_for({date, _}), do: date
+
+  defp date_with_time({year, month, day}, time) do
+    parts = [year: year, month: month, day: day] ++ time
+
+    combine(parts)
+  end
+
+  defp debug(result, debug) when debug == true do
+    # credo:disable-for-next-line
+    IO.inspect(result)
+  end
+
+  defp debug(result, _debug) do
+    result
+  end
+end
